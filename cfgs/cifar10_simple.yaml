@@ -1,0 +1,15 @@
+accelerator: gpu
+batch_size: 256
+check_val_every_n_epoch: 10
+ckpt_every_n_epoch: 10
+cnn_padding: 1
+datamodule: cifar10
+devices: 1
+lr: 0.05
+max_epochs: 50
+mlp_hidden_dim: 128
+mlp_num_layers: 2
+model: resnet
+resnet_small_input: True
+resnet_version: 18
+weight_decay: 0

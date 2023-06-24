@@ -1,0 +1,17 @@
+accelerator: gpu
+batch_size: 256
+check_val_every_n_epoch: 20
+ckpt_every_n_epoch: 20
+cnn_initial_width: 16
+cnn_num_layers: 1
+datamodule: mnist
+devices: 1
+dropout_prob: 0.5
+input_channels: 1
+lr: 0.02
+max_epochs: 3
+mlp_input_dim: 784
+model: cnn
+mlp_num_layers: 5
+bias: True
+mlp_hidden_dim: 2000
