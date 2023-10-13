@@ -1,8 +1,8 @@
 accelerator: gpu
-batch_size: 4
+batch_size: 64
 check_val_every_n_epoch: 10
 ckpt_every_n_epoch: 10
-cnn_initial_width: 64
+cnn_initial_width: 256
 cnn_padding: 1
 datamodule: cifar10
 devices: 1

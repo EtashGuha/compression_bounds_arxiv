@@ -4,6 +4,7 @@
 import os
 import os.path as osp
 import resource
+import pickle
 from copy import deepcopy
 from scipy.stats import bernoulli
 # Imports Python packages.
@@ -13,7 +14,7 @@ import matplotlib.pyplot as plt
 # Imports PyTorch packages.
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
-from pytorch_lightning.utilities.seed import seed_everything
+# from pytorch_lightning.utilities import seed_everything
 import torch
 import copy
 import scipy
@@ -121,13 +122,15 @@ def load_trainer(args, addtl_callbacks=None):
     progress_bar = TQDMProgressBar(refresh_rate=args.refresh_rate)
 
     # Sets DDP strategy for multi-GPU training.
-    args.devices = int(args.devices)
-    args.strategy = "ddp" if args.devices > 1 else None
+    # args.devices = int(args.devices)
+    args.accelerator == "cpu"
+    # args.strategy = "ddp" if args.devices > 1 else None
 
     callbacks = [checkpointer1, checkpointer2, progress_bar]
     if isinstance(addtl_callbacks, list):
         callbacks.extend(addtl_callbacks)
-    trainer = Trainer.from_argparse_args(args, callbacks=callbacks)
+    # trainer = Trainer.from_argparse_args(args, callbacks=callbacks)
+    trainer = Trainer(accelerator="cpu", max_epochs=100)
 
     return trainer
 def prune_weights(original_weights, alpha):
@@ -223,7 +226,7 @@ def main(args, model_class, datamodule_class, callbacks=None, model_hooks=None):
 
     # Sets global seed for reproducibility. Due to CUDA operations which can't
     # be made deterministic, the results may not be perfectly reproducible.
-    seed_everything(seed=args.seed, workers=True)
+    # seed_everything(seed=args.seed, workers=True)
 
     datamodule = load_datamodule(args, datamodule_class)
     args.num_classes = datamodule.num_classes
@@ -232,8 +235,8 @@ def main(args, model_class, datamodule_class, callbacks=None, model_hooks=None):
     if model_hooks:
         for hook in model_hooks:
             hook(model)
-                
-    def find_alpha_true(alpha, model, pre_input_margin):
+
+    def get_error(alpha, model, trainer):
         model = model.cuda()
         new_generalization_bound = 0
         with torch.no_grad():
@@ -244,17 +247,65 @@ def main(args, model_class, datamodule_class, callbacks=None, model_hooks=None):
         max_difference = -1
         model = model.cuda()
         new_model = new_model.cuda()
+        metrics = trainer.test(new_model, datamodule)
+        
+        return metrics
+                
+    def find_alpha_true(alpha, model):
+        new_generalization_bound = 0
+        model = model.cpu()
+        with torch.no_grad():
+            new_model = copy.deepcopy(model).cpu()
+            for index, (name, module) in enumerate(model.named_modules()):
+                if isinstance(module, torch.nn.Linear):
+                    set_weights(new_model,index, prune_weights(module.weight.cpu(), alpha))
+        max_difference = -1
         with torch.no_grad():
             for batch_idx, (data, target) in enumerate(datamodule.train_dataloader()):
-                data = data.cuda()
-                target = target.cuda()
+                data = data.cpu()
+                target = target.cpu()
+                model = model.cpu()
+                new_model = new_model.cpu()
+
+
                 original_output = model(data)
                 edited_output = new_model(data)
                 original_correct_scores = original_output.gather(1, target.view(-1, 1)).squeeze()
                 edited_correct_scores = edited_output.gather(1, target.view(-1, 1)).squeeze()
                 max_difference = max(torch.max(abs(original_correct_scores - edited_correct_scores)), max_difference)
 
-        return pre_input_margin - max_difference
+        sum_of_diffs = 0
+        product_of_norms = 1
+        product_of_constants = 1
+        diffs = []
+
+        for index, (name, module) in enumerate(model.named_modules()):
+            if isinstance(module, torch.nn.Linear):
+                product_of_norms *= np.linalg.norm(module.weight.detach().cpu().numpy(), ord=2)
+                hat_matrix = list(new_model.cpu().named_modules())[index][1].weight.detach().numpy()
+                diffs.append(np.linalg.norm(module.weight.detach().cpu().numpy()) - np.linalg.norm(hat_matrix))           
+                diff = np.linalg.norm(module.weight.detach().cpu().numpy() - hat_matrix, ord=2)
+                sum_of_diffs += diff/np.linalg.norm(module.weight.detach().cpu().numpy(), ord=2)
+                d_1, d_2 = module.weight.T.shape
+                if d_2 < d_1:
+                    t_val = scipy.optimize.bisect(lambda t: 1 - len(datamodule.train_dataloader().dataset)*np.exp(-t * t * d_1)-.99, 0, 1, xtol=.01)
+                    constant = t_val * np.sqrt(d_2) 
+                    if constant > 1:
+                        constant = 1
+                else:
+                    constant = 1
+                product_of_constants *= constant
+
+        new_model = new_model.cpu()
+        max_input_norm = 0
+        model = model.cpu()
+        new_model = new_model.cpu()
+        for batch_idx, (data, target) in enumerate(datamodule.train_dataloader()):
+            data.cpu()
+            flattened_data = data.flatten(2,3).squeeze(1)
+            max_input_norm = max(max_input_norm, torch.max(torch.norm(flattened_data, dim=1, p=2)))
+        needed_margin =  np.e * max_input_norm * sum_of_diffs * product_of_norms * product_of_constants
+        return max_difference, needed_margin, np.mean(diffs)
 
     def calc_neyshabur(model, gamma):
         initial_value = 1
@@ -298,10 +349,12 @@ def main(args, model_class, datamodule_class, callbacks=None, model_hooks=None):
         product_of_norms = 1
         product_of_constants = 1
         sum_of_diffs = 0
+        diffs = []
         for index, (name, module) in enumerate(model.named_modules()):
             if isinstance(module, torch.nn.Linear):
                 product_of_norms *= np.linalg.norm(module.weight.detach().cpu().numpy(), ord=2)
-                hat_matrix = list(new_model.cpu().named_modules())[index][1].weight.detach().numpy()            
+                hat_matrix = list(new_model.cpu().named_modules())[index][1].weight.detach().numpy()   
+                diffs.append(np.linalg.norm(hat_matrix) - np.linalg.norm(module.weight.detach().cpu().numpy(), ord=2))         
                 diff = np.linalg.norm(module.weight.detach().cpu().numpy() - hat_matrix, ord=2)
                 sum_of_diffs += diff/np.linalg.norm(module.weight.detach().cpu().numpy(), ord=2)
                 d_1, d_2 = module.weight.T.shape
@@ -324,6 +377,19 @@ def main(args, model_class, datamodule_class, callbacks=None, model_hooks=None):
         needed_margin =  np.e * max_input_norm * sum_of_diffs * product_of_norms * product_of_constants
         return pre_input_margin - needed_margin
 
+    def get_number_of_zeros(model, alpha):
+        max_weight = 1
+        with torch.no_grad():
+            new_model = copy.deepcopy(model)
+            for index, (name, module) in enumerate(model.named_modules()):
+                if isinstance(module, torch.nn.Linear):
+                    prune_weights(module.weight.cpu(), alpha)
+                    if module.weight.shape[1] > max_weight:
+                        num_zero = torch.sum(prune_weights(module.weight.cpu(), alpha) != 0, dim=1)
+                        max_weight = module.weight.shape[1]
+                        predicted = 3 * module.weight.shape[1] * (np.sqrt(alpha + 2) - np.sqrt(alpha))/np.sqrt(alpha + 2)
+
+        return np.max(num_zero.detach().numpy()), predicted
     def compute_best_generalization_bound(model, alpha):
         model = model.cuda()
 
@@ -377,29 +443,50 @@ def main(args, model_class, datamodule_class, callbacks=None, model_hooks=None):
     margins = []
     num_epochs = 300
     epochs = []
+    trainer = load_trainer(args, addtl_callbacks=callbacks)
+    trainer.fit(model, datamodule=datamodule, ckpt_path=args.ckpt_path)
+    trus=[]
+    fas = []
+    for i in np.linspace(0, 10, 100):
+        a, b, _ = find_alpha_true(i, model)
+        trus.append(a.item())
+        fas.append(b.item())
+
+    predicted_counts = []
+    true_counts = []
+    for i in np.linspace(0, 10, 100):
+        true, predicted = get_number_of_zeros(model, i)
+        true_counts.append(true)
+        predicted_counts.append(predicted)
+    with open("cifar.pkl" , "wb") as f:
+        pickle.dump((trus, fas), f)
+    with open("cifar_num_counts.pkl", "wb") as f:
+        pickle.dump((true_counts, predicted_counts), f)
+
+    breakpoint()
     # for epoch_iteration in range(num_epochs):
-    for epoch in range(num_epochs):
-        trainer = load_trainer(args, addtl_callbacks=callbacks)
-        trainer.fit(model, datamodule=datamodule, ckpt_path=args.ckpt_path)
-        model_margin = get_margin(model, datamodule.train_dataloader()) 
-        if model_margin > 0:
-            best_alpha = scipy.optimize.bisect(find_alpha,  0, 10, args= (model, model_margin), xtol=1e-3)
-        else: 
-            model_margin = 0
-            best_alpha = 0
-        our_generalization_bound, true_generalization = compute_best_generalization_bound(model, best_alpha)
-        our_generalization_bounds.append(our_generalization_bound)
-        true_generalizations.append(true_generalization)
-        neyshabur_seconds.append(calc_second_neyshabur(model, model_margin))
-        margins.append(model_margin)
-        neyshaburs.append(calc_neyshabur(model, model_margin))
-        bartletts.append(calc_bartlett(model, model_margin))
-        epochs.append(epoch)
-        alphas.append(best_alpha)
+    # for epoch in range(num_epochs):
+    #     trainer = load_trainer(args, addtl_callbacks=callbacks)
+    #     trainer.fit(model, datamodule=datamodule, ckpt_path=args.ckpt_path)
+    #     model_margin = get_margin(model, datamodule.train_dataloader()) 
+    #     if model_margin > 0:
+    #         best_alpha = scipy.optimize.bisect(find_alpha,  0, 10, args= (model, model_margin), xtol=1e-3)
+    #     else: 
+    #         model_margin = 0
+    #         best_alpha = 0
+    #     our_generalization_bound, true_generalization = compute_best_generalization_bound(model, best_alpha)
+    #     our_generalization_bounds.append(our_generalization_bound)
+    #     true_generalizations.append(true_generalization)
+    #     neyshabur_seconds.append(calc_second_neyshabur(model, model_margin))
+    #     margins.append(model_margin)
+    #     neyshaburs.append(calc_neyshabur(model, model_margin))
+    #     bartletts.append(calc_bartlett(model, model_margin))
+    #     epochs.append(epoch)
+    #     alphas.append(best_alpha)
         
     
-        with open("results_dir/{}.pkl".format(args.datamodule), "wb") as f:
-            pickle.dump((our_generalization_bounds, true_generalizations, margins, alphas, neyshaburs, bartletts, neyshabur_seconds, epochs), f)
+    #     with open("results_dir/{}.pkl".format(args.datamodule), "wb") as f:
+    #         pickle.dump((our_generalization_bounds, true_generalizations, margins, alphas, neyshaburs, bartletts, neyshabur_seconds, epochs), f)
     
     args.ckpt_path = None
     return model
